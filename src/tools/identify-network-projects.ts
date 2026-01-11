@@ -1,5 +1,5 @@
-
 import { AssetServiceClient } from '@google-cloud/asset';
+import { SubnetworksClient, ProjectsClient } from '@google-cloud/compute';
 import { FunctionTool } from '@google/adk';
 import { Type } from '@google/genai';
 
@@ -19,7 +19,7 @@ function extractProjectFromUrl(url: string | null | undefined): string | null {
   return match ? match[1] : null;
 }
 
-async function detectAgentScope(params: any): Promise<any> {
+export async function detectAgentScope(params: any): Promise<any> {
   const rootProjectsInput = params.rootProjects;
   // Handle both array and string inputs
   let startProjects: string[] = [];
@@ -38,17 +38,78 @@ async function detectAgentScope(params: any): Promise<any> {
 
   for (const projectId of startProjects) {
     const scope = `projects/${projectId}`;
-    console.log(`[AgentScope] Scanning ${scope}...`);
+    console.log(`[AgentScope] Scanning ${scope}... (Version: XPN_HOST_FIX_V2)`);
 
     try {
-      // 1. Shared VPC: Check Subnetworks.
-      // If a subnetwork is in this project, check its 'network' field.
-      // If the network is in another project -> That other project is a Host Project.
-      // Note: In CAIS, searchAllResources returns 'additionalAttributes' which might contain specific fields.
-      // However, we often just get high level metadata. 
-      // Checking 'network' field usually requires reading the resource or relying on strict naming if preserved.
+      // --- 0. XPN Host Detection (getXpnHost) ---
+      try {
+        const projectsClient = new ProjectsClient();
+        console.log(`[AgentScope] Step 0: Checking XPN Host for ${projectId}...`);
+        const [xpnHost] = await projectsClient.getXpnHost({ project: projectId });
 
-      // Let's search for subnetworks and networks first.
+        // xpnHost is a Project resource, usually just the project ID string or object?
+        // Actually getXpnHost returns a Project resource representing the Host Project.
+        // Wait, checking docs: getXpnHost returns a Project object.
+        if (xpnHost && xpnHost.name) {
+          console.log(`[AgentScope] Found XPN Host: ${xpnHost.name}`);
+          const hostProject = xpnHost.name;
+          if (hostProject !== projectId) {
+            if (!visitedProjects.has(hostProject)) {
+              visitedProjects.add(hostProject);
+              projectGraph.push({
+                source: projectId,
+                target: hostProject,
+                reason: `Project is a Service Project attached to Host Project ${hostProject}`
+              });
+            }
+          }
+        }
+      } catch (err: any) {
+        // 404 if not found or not a service project? 
+        // Docs say: "If the project is not a service project, this method returns an error." or empty?
+        // Actually usually 403 or just returns self?
+        console.log(`[AgentScope] getXpnHost failed/skipped: ${err.message}`);
+      }
+
+      console.log(`[AgentScope] Step 1: listUsable for ${projectId}`);
+      // --- 4. Shared VPC (listUsable) ---
+      // This is the most reliable way to find Host Projects if you are a Service Project.
+      try {
+        const subnetsClient = new SubnetworksClient();
+        const request = { project: projectId };
+        console.log(`[AgentScope] Calling listUsable API for ${projectId}...`);
+        const usableSubnets = subnetsClient.listUsableAsync(request);
+
+        let usableCount = 0;
+        for await (const subnet of usableSubnets) {
+          usableCount++;
+          const rawUrl = subnet.subnetwork || subnet.network;
+          console.log(`[AgentScope] Usable subnet: ${rawUrl}`);
+
+          if (rawUrl) {
+            const match = rawUrl.match(/projects\/([^\/]+)\//);
+            if (match) {
+              const detectedProject = match[1];
+              if (detectedProject !== projectId) {
+                if (!visitedProjects.has(detectedProject)) {
+                  visitedProjects.add(detectedProject);
+                  projectGraph.push({
+                    source: projectId,
+                    target: detectedProject,
+                    reason: `Project has usable subnet ${rawUrl} from Host Project ${detectedProject}`
+                  });
+                }
+              }
+            }
+          }
+        }
+        console.log(`[AgentScope] listUsable finished. Found ${usableCount} usable subnets.`);
+      } catch (err: any) {
+        console.warn(`[AgentScope] listUsable failed for ${projectId}:`, err.message);
+      }
+
+      console.log(`[AgentScope] Step 2: searchAllResources for ${projectId}`);
+      // 1. Resources Search
       const [resources] = await client.searchAllResources({
         scope,
         assetTypes: [
@@ -80,7 +141,28 @@ async function detectAgentScope(params: any): Promise<any> {
 
           // Wait, if I am in Service Project, I deploy instances.
           // Maybe I should search for Instances and check their network interfaces?
-          // YES. Instances are the specific resources binding the project to the network.
+        } else if (res.assetType === 'compute.googleapis.com/ForwardingRule') {
+          // Check Forwarding Rules for Shared VPC
+          // Attributes often contain 'subnetwork' or 'network'
+          const attrs: any = res.additionalAttributes || {};
+          const urisToCheck = [attrs.subnetwork, attrs.network].filter(u => typeof u === 'string');
+
+          for (const uri of urisToCheck) {
+            const match = uri.match(/projects\/([^\/]+)\//);
+            if (match) {
+              const detectedProject = match[1];
+              if (detectedProject !== projectId) {
+                if (!visitedProjects.has(detectedProject)) {
+                  visitedProjects.add(detectedProject);
+                  projectGraph.push({
+                    source: projectId,
+                    target: detectedProject,
+                    reason: `ForwardingRule ${res.displayName} uses network/subnet in ${detectedProject}`
+                  });
+                }
+              }
+            }
+          }
         }
       }
 
@@ -97,33 +179,32 @@ async function detectAgentScope(params: any): Promise<any> {
 
       for (const inst of instances) {
         // Check network interfaces
-        // additionalAttributes.networkInterfaces usually in JSON format
-        const rawAttrs = inst.additionalAttributes;
-        if (rawAttrs && (rawAttrs as any).networkInterfaces) {
-          const nics = Array.isArray((rawAttrs as any).networkInterfaces) ? (rawAttrs as any).networkInterfaces : [(rawAttrs as any).networkInterfaces];
-          // It might be parsed structure or string? SDK usually parses struct if compatible.
-          // CAIS searchAllResources often returns specific flat fields or Structs.
-          // Let's assume generic access.
+        const rawAttrs: any = inst.additionalAttributes;
+        if (rawAttrs && rawAttrs.networkInterfaces) {
+          const nics = Array.isArray(rawAttrs.networkInterfaces) ? rawAttrs.networkInterfaces : [rawAttrs.networkInterfaces];
 
-          // NOTE: 'network' and 'subnetwork' fields in Instance resource are URLs like:
-          // https://www.googleapis.com/compute/v1/projects/{HOST_PROJECT}/global/networks/{NETWORK}
+          for (const nic of nics) {
+          // Check 'network' and 'subnetwork' fields
+          // Format: https://www.googleapis.com/compute/v1/projects/{HOST_PROJECT}/global/networks/{NETWORK}
+          // or relative: projects/{HOST_PROJECT}/global/networks/{NETWORK}
 
-          // Since 'rawAttrs' structure key names can be dynamic or nested, we rely on JSON stringify if needed 
-          // or just standard pattern matching on the whole attributes dump if simpler, but let's try direct access.
+            const urisToCheck = [nic.network, nic.subnetwork].filter(u => typeof u === 'string');
 
-          // Using JSON serialization to be safe on type inspection
-          const attrsString = JSON.stringify(rawAttrs);
-          const projectMatches = attrsString.matchAll(/projects\/([^\/"]+)\//g);
-          for (const match of projectMatches) {
-            const detectedProject = match[1];
-            if (detectedProject !== projectId && detectedProject !== 'google-cloud-clients') {
-              if (!visitedProjects.has(detectedProject)) {
-                visitedProjects.add(detectedProject);
-                projectGraph.push({
-                  source: projectId,
-                  target: detectedProject,
-                  reason: `Instance ${inst.displayName} references resource in ${detectedProject} (Likely Shared VPC Host or Image source)`
-                });
+            for (const uri of urisToCheck) {
+              // Extract project from URI: projects/PROJECT_ID/
+              const match = uri.match(/projects\/([^\/]+)\//);
+              if (match) {
+                const detectedProject = match[1];
+                if (detectedProject !== projectId && detectedProject !== 'google-cloud-clients') {
+                  if (!visitedProjects.has(detectedProject)) {
+                    visitedProjects.add(detectedProject);
+                    projectGraph.push({
+                      source: projectId,
+                      target: detectedProject,
+                      reason: `Instance ${inst.displayName} uses network/subnet in ${detectedProject} (Shared VPC Host)`
+                    });
+                  }
+                }
               }
             }
           }
@@ -178,6 +259,8 @@ async function detectAgentScope(params: any): Promise<any> {
           }
         }
       }
+
+
 
 
     } catch (e: any) {
